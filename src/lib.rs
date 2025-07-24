@@ -5,32 +5,27 @@
 //!
 //! # Features
 //!
-//! - **Source trait**: Query configuration data from various sources efficiently
-//! - **Visitor pattern**: Load only required values, supporting arbitrarily large sources
-//! - **Environment variables**: Support for nested keys with prefix filtering
+//! - **Source trait**: Provide configuration values efficiently from various sources
+//! - **Direct source visiting**: Config types visit sources directly for needed values
+//! - **Environment variables**: Support for simple field-based environment variable mapping
 //! - **Serde integration**: Works with any serde-compatible types
 //! - **Layered configuration**: Merge multiple sources with override support
 //! - **Builder pattern**: Flexible configuration building
 //!
 //! # Architecture
 //!
-//! The library uses a visitor pattern to efficiently handle large configuration sources.
-//! Instead of loading entire sources into memory, configuration types specify which
-//! values they need, and sources are queried only for those specific keys.
+//! The library uses a direct visiting pattern where Config implementations visit sources
+//! to gather the values they need. Sources provide values for specific fields rather than
+//! complex key paths, keeping the architecture simple and efficient.
 //!
 //! This design allows the library to work with:
-//! - Large databases (implement `Source` with SQL queries)
-//! - Remote APIs (implement `Source` with HTTP requests)  
-//! - File systems (implement `Source` with file I/O)
-//! - In-memory data (use `DeserializerSource` for convenience)
-//! - Any source that can provide key-value lookups
+//! - Large databases (implement `Source` with SQL queries for specific fields)
+//! - Remote APIs (implement `Source` with HTTP requests for individual fields)  
+//! - File systems (implement `Source` with field-based file lookups)
+//! - Environment variables (use `EnvSource` for field-based env var mapping)
+//! - Any source that can provide field-value lookups
 //!
 //! ## Source Implementations
-//!
-//! ### `DeserializerSource<T>`
-//! - Best for: Small to medium in-memory data structures
-//! - Limitation: Serializes data for each query (not suitable for very large data)
-//! - Use case: Configuration structs, JSON files loaded into memory
 //!
 //! ### Custom `Source` Implementations  
 //! - Best for: Large external sources (databases, APIs, file systems)
@@ -38,14 +33,14 @@
 //! - Use case: Production applications with large configuration datasets
 //!
 //! ### `EnvSource`
-//! - Queries environment variables directly
+//! - Queries environment variables directly using simple field names
 //! - Naturally scalable (no memory limitations)
-//! - Supports nested keys with configurable separators
+//! - Maps field names to environment variables with optional prefixes
 //!
 //! # Quick Start
 //!
 //! ```rust
-//! use ucfg::{Builder, DeserializerSource, EnvSource};
+//! use ucfg::{Builder, EnvSource};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,15 +50,8 @@
 //! }
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create base configuration
-//! let base = serde_json::json!({
-//!     "name": "MyApp",
-//!     "port": 8080
-//! });
-//!
-//! // Build layered configuration
+//! // Build configuration from environment variables
 //! let config: Config = Builder::new()
-//!     .add_source(DeserializerSource::new(base))
 //!     .add_source(EnvSource::with_prefix("APP"))
 //!     .build()?;
 //!
@@ -74,15 +62,15 @@
 //!
 //! # Environment Variables
 //!
-//! Environment variables are mapped to nested configuration using `__` as separator:
+//! Environment variables are mapped to configuration fields using simple names:
 //!
-//! - `APP_name` → `name`
-//! - `APP_database__host` → `database.host`
-//! - `APP_server__port` → `server.port`
+//! - `APP_name` → `name` field
+//! - `APP_port` → `port` field
+//! - `APP_enabled` → `enabled` field
 //!
 //! # Scalability
 //!
-//! The visitor pattern ensures that only required configuration values are loaded,
+//! The direct visiting pattern ensures that only required configuration values are loaded,
 //! making it efficient even for very large configuration sources. Sources can be
 //! arbitrarily large (databases, APIs, file systems) without memory concerns.
 
@@ -93,8 +81,8 @@ pub mod source;
 pub mod config;
 pub mod builder;
 
-pub use source::{Source, DeserializerSource, EnvSource};
-pub use config::{Config, ConfigVisitor, SourceVisitor, FromStrConfig, value_from_str};
+pub use source::{Source, EnvSource};
+pub use config::{Config, FromStrConfig, value_from_str};
 pub use builder::Builder;
 
 /// Error type for configuration operations
@@ -140,76 +128,36 @@ mod integration_tests {
     struct AppConfig {
         name: String,
         port: u16,
-        database: DatabaseConfig,
-        features: FeaturesConfig,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-    struct DatabaseConfig {
-        host: String,
-        port: u16,
-        username: String,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-    struct FeaturesConfig {
-        logging: bool,
-        metrics: bool,
+        enabled: bool,
     }
 
     #[test]
-    fn test_full_configuration_example() {
+    fn test_configuration_example() {
         // Setup environment variables
         unsafe {
             env::set_var("APP_name", "ProductionApp");
-            env::set_var("APP_database__username", "produser");
+            env::set_var("APP_port", "8080");
+            env::set_var("APP_enabled", "true");
         }
 
-        // Base configuration from code
-        let base_config = serde_json::json!({
-            "name": "MyApp",
-            "port": 8080,
-            "database": {
-                "host": "localhost",
-                "port": 5432,
-                "username": "dev"
-            },
-            "features": {
-                "logging": true,
-                "metrics": false
-            }
-        });
-
-        // Override configuration
-        let override_config = serde_json::json!({
-            "port": 9000,
-            "features": {
-                "logging": false
-            }
-        });
-
-        // Build configuration with multiple sources
+        // Build configuration from environment
         let final_config: AppConfig = Builder::new()
-            .add_source(DeserializerSource::new(base_config))
             .add_source(EnvSource::with_prefix("APP"))
-            .add_source(DeserializerSource::new(override_config))
             .build()
             .unwrap();
 
         println!("Final config: {:#?}", final_config);
 
-        // Verify the layered configuration
-        assert_eq!(final_config.name, "ProductionApp");           // from env
-        assert_eq!(final_config.port, 9000);                     // from override
-        assert_eq!(final_config.database.host, "localhost");     // from base
-        assert_eq!(final_config.database.username, "produser");  // from env
-        assert_eq!(final_config.features.logging, false);        // from override
-        assert_eq!(final_config.features.metrics, false);        // from base
+        // Verify the configuration
+        assert_eq!(final_config.name, "ProductionApp");
+        assert_eq!(final_config.port, 8080);
+        assert_eq!(final_config.enabled, true);
 
         // Cleanup
         unsafe {
             env::remove_var("APP_name");
-            env::remove_var("APP_database__username");
+            env::remove_var("APP_port");
+            env::remove_var("APP_enabled");
         }
     }
 }

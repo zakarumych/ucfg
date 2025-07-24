@@ -4,74 +4,31 @@ use crate::{Error, Result, Source};
 use serde::de::DeserializeOwned;
 use std::str::FromStr;
 
-/// Trait for types that can be configured from sources using a visitor pattern
-///
-/// Instead of loading entire sources into memory, configs can request specific
-/// values from sources by key, enabling efficient configuration from large sources.
-pub trait Config: Sized {
-    /// Configure this type by visiting sources to collect required values
-    /// 
-    /// The implementation should call `visitor.visit(key)` for each configuration
-    /// value it needs, where the visitor will query the sources in order.
-    fn configure_with_visitor<V: ConfigVisitor>(visitor: V) -> Result<Self>;
-}
-
-/// Visitor trait for collecting configuration values from sources
-pub trait ConfigVisitor {
-    /// Visit a configuration key and get its value from the sources
-    /// 
-    /// Sources are checked in order, and the first source that contains
-    /// the key provides the value.
-    fn visit(&self, key: &str) -> Result<Option<String>>;
-    
-    /// Visit a configuration key with a default value
-    fn visit_with_default(&self, key: &str, default: &str) -> Result<String> {
-        self.visit(key).map(|opt| opt.unwrap_or_else(|| default.to_string()))
-    }
-}
-
-/// Implementation of ConfigVisitor that queries multiple sources in order
-pub struct SourceVisitor<'a> {
-    sources: &'a [Box<dyn Source>],
-}
-
-impl<'a> SourceVisitor<'a> {
-    pub fn new(sources: &'a [Box<dyn Source>]) -> Self {
-        Self { sources }
-    }
-}
-
-impl<'a> ConfigVisitor for SourceVisitor<'a> {
-    fn visit(&self, key: &str) -> Result<Option<String>> {
-        // Check sources in reverse order so later sources override earlier ones
-        for source in self.sources.iter().rev() {
-            if let Some(value) = source.get(key)? {
-                return Ok(Some(value));
-            }
-        }
-        Ok(None)
-    }
-}
-
-/// Blanket implementation for types that implement serde::Deserialize
+/// Trait for types that can be configured by visiting sources
 /// 
-/// This implementation uses serde's derive macros to automatically discover
-/// the field structure and query sources for the required values.
+/// The Config implementation visits sources to gather the values it needs
+/// and assembles them into the final configuration.
+pub trait Config: Sized {
+    /// Configure this type by visiting the provided sources
+    /// 
+    /// Sources are checked in order, with later sources overriding earlier ones.
+    /// The implementation should query only the fields it needs.
+    fn configure_from_sources(sources: &[Box<dyn Source>]) -> Result<Self>;
+}
+
+/// Blanket implementation for types that implement serde::Deserialize and Default
 impl<T> Config for T
 where
     T: DeserializeOwned + serde::Serialize + Default,
 {
-    fn configure_with_visitor<V: ConfigVisitor>(visitor: V) -> Result<Self> {
-        // For serde types, we need to build a JSON value from the visitor
-        // and then deserialize it. This requires discovering the structure.
-        
-        // Start with the default value to get the structure
+    fn configure_from_sources(sources: &[Box<dyn Source>]) -> Result<Self> {
+        // Start with the default instance to discover the structure
         let default_instance = T::default();
         let default_json = serde_json::to_value(&default_instance)
             .map_err(|e| Error::Deserialize(e.to_string()))?;
             
-        // Recursively visit all keys in the default structure
-        let configured_json = visit_json_structure(&visitor, &default_json, "")?;
+        // Visit sources to build the final configuration
+        let configured_json = visit_sources_for_json(sources, &default_json)?;
         
         // Deserialize the final JSON
         serde_json::from_value(configured_json)
@@ -79,71 +36,34 @@ where
     }
 }
 
-/// Helper function to recursively visit JSON structure and replace values from sources
-fn visit_json_structure<V: ConfigVisitor>(
-    visitor: &V,
-    json: &serde_json::Value,
-    key_prefix: &str,
+/// Helper function to visit sources and build JSON configuration
+fn visit_sources_for_json(
+    sources: &[Box<dyn Source>],
+    default_json: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    match json {
+    match default_json {
         serde_json::Value::Object(map) => {
             let mut result = serde_json::Map::new();
             
-            for (key, value) in map {
-                let full_key = if key_prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", key_prefix, key)
-                };
+            for (field, default_value) in map {
+                // Visit sources in reverse order so later sources override earlier ones
+                let mut final_value = default_value.clone();
                 
-                let new_value = visit_json_structure(visitor, value, &full_key)?;
-                result.insert(key.clone(), new_value);
+                for source in sources.iter().rev() {
+                    if let Some(source_value) = source.get_field(field)? {
+                        final_value = source_value;
+                        break; // Use the first source that has this field
+                    }
+                }
+                
+                result.insert(field.clone(), final_value);
             }
             
             Ok(serde_json::Value::Object(result))
         }
         _ => {
-            // For leaf values, try to get from sources
-            if let Some(source_value) = visitor.visit(key_prefix)? {
-                // Try to parse the source value as the same type as the default
-                parse_source_value_as_json(&source_value, json)
-            } else {
-                // Use the default value
-                Ok(json.clone())
-            }
-        }
-    }
-}
-
-/// Helper function to parse a source value string as a JSON value of the expected type
-fn parse_source_value_as_json(source_value: &str, expected_type: &serde_json::Value) -> Result<serde_json::Value> {
-    match expected_type {
-        serde_json::Value::String(_) => Ok(serde_json::Value::String(source_value.to_string())),
-        serde_json::Value::Number(_) => {
-            // Try to parse as number
-            if let Ok(int_val) = source_value.parse::<i64>() {
-                Ok(serde_json::Value::Number(serde_json::Number::from(int_val)))
-            } else if let Ok(float_val) = source_value.parse::<f64>() {
-                Ok(serde_json::Value::Number(
-                    serde_json::Number::from_f64(float_val)
-                        .ok_or_else(|| Error::Deserialize("Invalid float value".to_string()))?
-                ))
-            } else {
-                Err(Error::Deserialize(format!("Cannot parse '{}' as number", source_value)))
-            }
-        }
-        serde_json::Value::Bool(_) => {
-            match source_value.to_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => Ok(serde_json::Value::Bool(true)),
-                "false" | "0" | "no" | "off" => Ok(serde_json::Value::Bool(false)),
-                _ => Err(Error::Deserialize(format!("Cannot parse '{}' as boolean", source_value))),
-            }
-        }
-        serde_json::Value::Null => Ok(serde_json::Value::Null),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            // Try to parse as JSON
-            serde_json::from_str(source_value)
-                .map_err(|e| Error::Deserialize(format!("Cannot parse '{}' as JSON: {}", source_value, e)))
+            // For non-object values, just return the default
+            Ok(default_json.clone())
         }
     }
 }
@@ -187,50 +107,60 @@ mod tests {
         enabled: bool,
     }
 
-    struct MockVisitor {
-        values: std::collections::HashMap<String, String>,
+    struct MockSource {
+        data: std::collections::HashMap<String, serde_json::Value>,
     }
 
-    impl MockVisitor {
+    impl MockSource {
         fn new() -> Self {
             Self {
-                values: std::collections::HashMap::new(),
+                data: std::collections::HashMap::new(),
             }
         }
         
-        fn with_value(mut self, key: &str, value: &str) -> Self {
-            self.values.insert(key.to_string(), value.to_string());
+        fn with_field(mut self, field: &str, value: serde_json::Value) -> Self {
+            self.data.insert(field.to_string(), value);
             self
         }
     }
 
-    impl ConfigVisitor for MockVisitor {
-        fn visit(&self, key: &str) -> Result<Option<String>> {
-            Ok(self.values.get(key).cloned())
+    impl Source for MockSource {
+        fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>> {
+            Ok(self.data.get(field).cloned())
         }
     }
 
     #[test]
-    fn test_config_with_visitor() {
-        let visitor = MockVisitor::new()
-            .with_value("name", "test")
-            .with_value("port", "8080")
-            .with_value("enabled", "true");
+    fn test_config_from_sources() {
+        let source1 = MockSource::new()
+            .with_field("name", serde_json::Value::String("test".to_string()))
+            .with_field("port", serde_json::Value::Number(serde_json::Number::from(8080)));
         
-        let config = TestConfig::configure_with_visitor(visitor).unwrap();
+        let source2 = MockSource::new()
+            .with_field("enabled", serde_json::Value::Bool(true));
+        
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(source1), Box::new(source2)];
+        let config = TestConfig::configure_from_sources(&sources).unwrap();
+        
         assert_eq!(config.name, "test");
         assert_eq!(config.port, 8080);
         assert_eq!(config.enabled, true);
     }
 
     #[test]
-    fn test_config_with_partial_visitor() {
-        let visitor = MockVisitor::new()
-            .with_value("name", "partial");
+    fn test_config_with_overrides() {
+        let source1 = MockSource::new()
+            .with_field("name", serde_json::Value::String("base".to_string()))
+            .with_field("port", serde_json::Value::Number(serde_json::Number::from(3000)));
         
-        let config = TestConfig::configure_with_visitor(visitor).unwrap();
-        assert_eq!(config.name, "partial");
-        assert_eq!(config.port, 0);  // default value
+        let source2 = MockSource::new()
+            .with_field("port", serde_json::Value::Number(serde_json::Number::from(8080)));
+        
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(source1), Box::new(source2)];
+        let config = TestConfig::configure_from_sources(&sources).unwrap();
+        
+        assert_eq!(config.name, "base");     // from source1
+        assert_eq!(config.port, 8080);      // overridden by source2
         assert_eq!(config.enabled, false);  // default value
     }
 
