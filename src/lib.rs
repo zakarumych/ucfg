@@ -2,6 +2,52 @@
 //!
 //! This library provides a comprehensive solution for configuring applications from various sources,
 //! layering configurations, supporting overloads, extensions, and more.
+//!
+//! # Features
+//!
+//! - **Source trait**: Load configuration data from various sources
+//! - **Environment variables**: Support for nested keys with prefix filtering
+//! - **Serde integration**: Works with any serde-compatible types
+//! - **Layered configuration**: Merge multiple sources with override support
+//! - **Builder pattern**: Flexible configuration building
+//!
+//! # Quick Start
+//!
+//! ```rust
+//! use ucfg::{Builder, DeserializerSource, EnvSource};
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+//! struct Config {
+//!     name: String,
+//!     port: u16,
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create base configuration
+//! let base = serde_json::json!({
+//!     "name": "MyApp",
+//!     "port": 8080
+//! });
+//!
+//! // Build layered configuration
+//! let config: Config = Builder::new()
+//!     .add_source(DeserializerSource::new(base))
+//!     .add_source(EnvSource::with_prefix("APP"))
+//!     .build()?;
+//!
+//! println!("Config: {:?}", config);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Environment Variables
+//!
+//! Environment variables are mapped to nested configuration using `__` as separator:
+//!
+//! - `APP_name` → `name`
+//! - `APP_database__host` → `database.host`
+//! - `APP_server__port` → `server.port`
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -46,3 +92,87 @@ impl StdError for Error {
 
 /// Result type for configuration operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use std::env;
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    struct AppConfig {
+        name: String,
+        port: u16,
+        database: DatabaseConfig,
+        features: FeaturesConfig,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    struct DatabaseConfig {
+        host: String,
+        port: u16,
+        username: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    struct FeaturesConfig {
+        logging: bool,
+        metrics: bool,
+    }
+
+    #[test]
+    fn test_full_configuration_example() {
+        // Setup environment variables - use lowercase to match JSON keys
+        unsafe {
+            env::set_var("APP_name", "ProductionApp");
+            env::set_var("APP_database__username", "produser");
+        }
+
+        // Base configuration from code
+        let base_config = serde_json::json!({
+            "name": "MyApp",
+            "port": 8080,
+            "database": {
+                "host": "localhost",
+                "port": 5432,
+                "username": "dev"
+            },
+            "features": {
+                "logging": true,
+                "metrics": false
+            }
+        });
+
+        // Override configuration
+        let override_config = serde_json::json!({
+            "port": 9000,
+            "features": {
+                "logging": false
+            }
+        });
+
+        // Build configuration with multiple sources
+        let final_config: serde_json::Value = Builder::new()
+            .add_source(DeserializerSource::new(base_config))
+            .add_source(EnvSource::with_prefix("APP"))
+            .add_source(DeserializerSource::new(override_config))
+            .build()
+            .unwrap();
+
+        println!("Final config: {:#?}", final_config);
+
+        // Verify the layered configuration
+        assert_eq!(final_config["name"], "ProductionApp");           // from env
+        assert_eq!(final_config["port"], 9000);                     // from override
+        assert_eq!(final_config["database"]["host"], "localhost");  // from base
+        assert_eq!(final_config["database"]["username"], "produser"); // from env
+        assert_eq!(final_config["features"]["logging"], false);     // from override
+        assert_eq!(final_config["features"]["metrics"], false);     // from base
+
+        // Cleanup
+        unsafe {
+            env::remove_var("APP_name");
+            env::remove_var("APP_database__username");
+        }
+    }
+}

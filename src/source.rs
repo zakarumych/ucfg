@@ -1,9 +1,7 @@
 //! Source trait and implementations for loading configuration data
 
 use crate::{Error, Result};
-use serde::de::Deserializer;
 use serde_json::Value;
-
 use std::env;
 
 /// Trait for loading configuration data from various sources
@@ -13,28 +11,26 @@ pub trait Source {
 }
 
 /// Source implementation for any serde Deserializer
-pub struct DeserializerSource<D> {
-    deserializer: D,
+/// This works with data that can be deserialized into a Value
+pub struct DeserializerSource<T> {
+    data: T,
 }
 
-impl<D> DeserializerSource<D> {
+impl<T> DeserializerSource<T> {
     /// Create a new DeserializerSource
-    pub fn new(deserializer: D) -> Self {
-        Self { deserializer }
+    pub fn new(data: T) -> Self {
+        Self { data }
     }
 }
 
-impl<D> Source for DeserializerSource<D>
+impl<T> Source for DeserializerSource<T>
 where
-    D: Deserializer<'static>,
+    T: serde::Serialize + Clone,
 {
     fn load(&self) -> Result<Value> {
-        // This is tricky because we can't deserialize into Value directly from any Deserializer
-        // without consuming it. For a real implementation, we'd need to handle this differently.
-        // For now, this is a placeholder that would need to be redesigned.
-        Err(Error::Source(
-            "DeserializerSource requires rework to handle arbitrary deserializers".into(),
-        ))
+        // Convert the data to a Value via serialization
+        serde_json::to_value(&self.data)
+            .map_err(|e| Error::Source(Box::new(e)))
     }
 }
 
@@ -158,6 +154,28 @@ fn merge_values(target: &mut Value, source: Value) -> Result<()> {
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn test_deserializer_source() {
+        use serde::{Deserialize, Serialize};
+        
+        #[derive(Serialize, Deserialize, Clone)]
+        struct TestData {
+            name: String,
+            value: i32,
+        }
+        
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+        
+        let source = DeserializerSource::new(data);
+        let result = source.load().unwrap();
+        
+        assert_eq!(result["name"], Value::String("test".to_string()));
+        assert_eq!(result["value"], Value::Number(serde_json::Number::from(42)));
+    }
 
     #[test]
     fn test_env_source_basic() {
