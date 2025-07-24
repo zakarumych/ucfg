@@ -29,7 +29,7 @@
 //! # Quick Start
 //!
 //! ```rust
-//! use ucfg::{Builder, EnvSource, Config, parse_field_value};
+//! use ucfg::{Builder, EnvSource, Config, get_field_value};
 //! use std::str::FromStr;
 //!
 //! #[derive(Debug, Clone, PartialEq)]
@@ -52,20 +52,24 @@
 //! impl Config for AppConfig {
 //!     fn configure_from_source(source: &dyn ucfg::Source) -> ucfg::Result<Self> {
 //!         let mut config = Self::default();
-//!         
-//!         if let Some(name) = source.get_field("name")? {
-//!             config.name = name;
-//!         }
-//!         
-//!         if let Some(port_str) = source.get_field("port")? {
-//!             config.port = parse_field_value(&port_str)?;
-//!         }
-//!         
-//!         if let Some(enabled_str) = source.get_field("enabled")? {
-//!             config.enabled = parse_field_value(&enabled_str)?;
-//!         }
-//!         
+//!         config.update_from_source(source)?;
 //!         Ok(config)
+//!     }
+//!     
+//!     fn update_from_source(&mut self, source: &dyn ucfg::Source) -> ucfg::Result<()> {
+//!         if let Some(name) = get_field_value::<String>(source, "name")? {
+//!             self.name = name;
+//!         }
+//!         
+//!         if let Some(port) = get_field_value::<u16>(source, "port")? {
+//!             self.port = port;
+//!         }
+//!         
+//!         if let Some(enabled) = get_field_value::<bool>(source, "enabled")? {
+//!             self.enabled = enabled;
+//!         }
+//!         
+//!         Ok(())
 //!     }
 //! }
 //!
@@ -101,8 +105,8 @@ pub mod source;
 pub mod config;
 pub mod builder;
 
-pub use source::{Source, EnvSource};
-pub use config::{Config, parse_field_value};
+pub use source::{Source, EnvSource, Visitor};
+pub use config::{Config, parse_field_value, get_field_value};
 pub use builder::Builder;
 
 /// Error type for configuration operations
@@ -166,20 +170,24 @@ mod integration_tests {
     impl Config for AppConfig {
         fn configure_from_source(source: &dyn Source) -> Result<Self> {
             let mut config = Self::default();
-            
-            if let Some(name) = source.get_field("name")? {
-                config.name = name;
-            }
-            
-            if let Some(port_str) = source.get_field("port")? {
-                config.port = config::parse_field_value(&port_str)?;
-            }
-            
-            if let Some(enabled_str) = source.get_field("enabled")? {
-                config.enabled = config::parse_field_value(&enabled_str)?;
-            }
-            
+            config.update_from_source(source)?;
             Ok(config)
+        }
+        
+        fn update_from_source(&mut self, source: &dyn Source) -> Result<()> {
+            if let Some(name) = config::get_field_value::<String>(source, "name")? {
+                self.name = name;
+            }
+            
+            if let Some(port) = config::get_field_value::<u16>(source, "port")? {
+                self.port = port;
+            }
+            
+            if let Some(enabled) = config::get_field_value::<bool>(source, "enabled")? {
+                self.enabled = enabled;
+            }
+            
+            Ok(())
         }
     }
 

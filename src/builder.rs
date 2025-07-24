@@ -2,11 +2,11 @@
 
 use crate::{Config, Result, Source};
 
-/// Builder that combines layers of sources to build configuration values
+/// Builder that provides sources to Config implementations
 /// 
-/// The builder coordinates between Config implementations and Sources,
-/// allowing Config to visit sources in the order they were added.
-/// Later sources override earlier ones when they provide values for the same fields.
+/// The builder coordinates by providing each source to the Config in order.
+/// Config implementations decide how to handle multiple sources - whether
+/// to override, merge, or apply custom logic.
 pub struct Builder {
     sources: Vec<Box<dyn Source>>,
 }
@@ -20,20 +20,32 @@ impl Builder {
     }
     
     /// Add a source to the builder
-    /// Sources are applied in the order they are added, with later sources
-    /// overriding values from earlier sources.
+    /// Sources are provided to Config in the order they are added.
+    /// Config implementations decide how to handle multiple sources.
     pub fn add_source<S: Source + 'static>(mut self, source: S) -> Self {
         self.sources.push(Box::new(source));
         self
     }
     
-    /// Build a configuration value by coordinating Config and Sources
+    /// Build a configuration value by providing each source to Config
     /// 
-    /// The builder creates a combined source that checks sources in reverse order
-    /// (latest first) so that later sources override earlier ones.
+    /// The builder provides sources to Config in order, allowing Config
+    /// to decide how to handle multiple sources.
     pub fn build<T: Config>(&self) -> Result<T> {
-        let combined_source = CombinedSource::new(&self.sources);
-        T::configure_from_source(&combined_source)
+        if self.sources.is_empty() {
+            // If no sources, try to create a default config from an empty source
+            return T::configure_from_source(&EmptySource);
+        }
+        
+        // Start with the first source
+        let mut config = T::configure_from_source(&*self.sources[0])?;
+        
+        // Update with remaining sources
+        for source in &self.sources[1..] {
+            config.update_from_source(&**source)?;
+        }
+        
+        Ok(config)
     }
     
     /// Get the number of sources in the builder
@@ -53,26 +65,12 @@ impl Default for Builder {
     }
 }
 
-/// Internal combined source that checks sources in override order
-struct CombinedSource<'a> {
-    sources: &'a [Box<dyn Source>],
-}
+/// Empty source for default configurations
+struct EmptySource;
 
-impl<'a> CombinedSource<'a> {
-    fn new(sources: &'a [Box<dyn Source>]) -> Self {
-        Self { sources }
-    }
-}
-
-impl<'a> Source for CombinedSource<'a> {
-    fn get_field(&self, field: &str) -> Result<Option<String>> {
-        // Check sources in reverse order so later sources override earlier ones
-        for source in self.sources.iter().rev() {
-            if let Some(value) = source.get_field(field)? {
-                return Ok(Some(value));
-            }
-        }
-        Ok(None)
+impl Source for EmptySource {
+    fn visit_field(&self, _field: &str, _visitor: &mut dyn crate::source::Visitor) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -101,16 +99,20 @@ mod tests {
     impl Config for TestConfig {
         fn configure_from_source(source: &dyn Source) -> Result<Self> {
             let mut config = Self::default();
-            
-            if let Some(name) = source.get_field("name")? {
-                config.name = name;
-            }
-            
-            if let Some(port_str) = source.get_field("port")? {
-                config.port = crate::config::parse_field_value(&port_str)?;
-            }
-            
+            config.update_from_source(source)?;
             Ok(config)
+        }
+        
+        fn update_from_source(&mut self, source: &dyn Source) -> Result<()> {
+            if let Some(name) = crate::config::get_field_value::<String>(source, "name")? {
+                self.name = name;
+            }
+            
+            if let Some(port) = crate::config::get_field_value::<u16>(source, "port")? {
+                self.port = port;
+            }
+            
+            Ok(())
         }
     }
 
@@ -133,8 +135,13 @@ mod tests {
     }
 
     impl Source for MockSource {
-        fn get_field(&self, field: &str) -> Result<Option<String>> {
-            Ok(self.data.get(field).cloned())
+        fn visit_field(&self, field: &str, visitor: &mut dyn crate::source::Visitor) -> Result<bool> {
+            if let Some(value) = self.data.get(field) {
+                visitor.visit_string(value.clone())?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
     }
 

@@ -3,19 +3,28 @@
 use crate::Result;
 use std::env;
 
+/// Visitor trait for handling different types of values from sources
+pub trait Visitor {
+    /// Handle a string value
+    fn visit_string(&mut self, value: String) -> Result<()>;
+    
+    /// Handle a JSON value (for structured data)
+    fn visit_json(&mut self, value: serde_json::Value) -> Result<()>;
+}
+
 /// Trait for configuration sources that can provide values for specific fields
 /// 
 /// Sources should be efficient and handle arbitrarily large datasets by providing
 /// values only for requested fields rather than loading entire datasets.
 /// 
-/// Sources can return string values or provide deserializer implementations
+/// Sources may contain string values or structured data with deserializers
 /// depending on the nature of the data source.
 pub trait Source {
-    /// Get a string value for a specific field
+    /// Visit a field with the provided visitor
     /// 
-    /// Returns None if the field is not available in this source.
+    /// Returns false if the field is not available in this source.
     /// The field name should be a simple identifier without complex paths.
-    fn get_field(&self, field: &str) -> Result<Option<String>>;
+    fn visit_field(&self, field: &str, visitor: &mut dyn Visitor) -> Result<bool>;
 }
 
 /// Source implementation for environment variables
@@ -53,9 +62,14 @@ impl Default for EnvSource {
 }
 
 impl Source for EnvSource {
-    fn get_field(&self, field: &str) -> Result<Option<String>> {
+    fn visit_field(&self, field: &str, visitor: &mut dyn Visitor) -> Result<bool> {
         let env_key = self.field_to_env_key(field);
-        Ok(env::var(&env_key).ok())
+        if let Ok(value) = env::var(&env_key) {
+            visitor.visit_string(value)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -64,6 +78,37 @@ mod tests {
     use super::*;
     use std::env;
 
+    // Test visitor that collects values
+    struct TestVisitor {
+        string_value: Option<String>,
+        json_value: Option<serde_json::Value>,
+    }
+
+    impl TestVisitor {
+        fn new() -> Self {
+            Self {
+                string_value: None,
+                json_value: None,
+            }
+        }
+
+        fn get_string_value(&self) -> Option<&String> {
+            self.string_value.as_ref()
+        }
+    }
+
+    impl Visitor for TestVisitor {
+        fn visit_string(&mut self, value: String) -> Result<()> {
+            self.string_value = Some(value);
+            Ok(())
+        }
+
+        fn visit_json(&mut self, value: serde_json::Value) -> Result<()> {
+            self.json_value = Some(value);
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_env_source_basic() {
         unsafe {
@@ -71,12 +116,16 @@ mod tests {
         }
         
         let source = EnvSource::with_prefix("TEST");
-        let result = source.get_field("KEY").unwrap();
+        let mut visitor = TestVisitor::new();
+        let found = source.visit_field("KEY", &mut visitor).unwrap();
         
-        assert_eq!(result, Some("test_value".to_string()));
+        assert!(found);
+        assert_eq!(visitor.get_string_value(), Some(&"test_value".to_string()));
         
         // Test non-existent field
-        assert_eq!(source.get_field("NONEXISTENT").unwrap(), None);
+        let mut visitor2 = TestVisitor::new();
+        let found = source.visit_field("NONEXISTENT", &mut visitor2).unwrap();
+        assert!(!found);
         
         unsafe {
             env::remove_var("TEST_KEY");
@@ -90,8 +139,11 @@ mod tests {
         }
         
         let source = EnvSource::new();
+        let mut visitor = TestVisitor::new();
+        let found = source.visit_field("SIMPLE_KEY", &mut visitor).unwrap();
         
-        assert_eq!(source.get_field("SIMPLE_KEY").unwrap(), Some("simple_value".to_string()));
+        assert!(found);
+        assert_eq!(visitor.get_string_value(), Some(&"simple_value".to_string()));
         
         unsafe {
             env::remove_var("SIMPLE_KEY");
@@ -109,9 +161,17 @@ mod tests {
         let source = EnvSource::with_prefix("TEST");
         
         // Environment source returns raw strings - parsing is done by Config
-        assert_eq!(source.get_field("number").unwrap(), Some("42".to_string()));
-        assert_eq!(source.get_field("flag").unwrap(), Some("true".to_string()));
-        assert_eq!(source.get_field("float").unwrap(), Some("3.14".to_string()));
+        let mut visitor1 = TestVisitor::new();
+        source.visit_field("number", &mut visitor1).unwrap();
+        assert_eq!(visitor1.get_string_value(), Some(&"42".to_string()));
+        
+        let mut visitor2 = TestVisitor::new();
+        source.visit_field("flag", &mut visitor2).unwrap();
+        assert_eq!(visitor2.get_string_value(), Some(&"true".to_string()));
+        
+        let mut visitor3 = TestVisitor::new();
+        source.visit_field("float", &mut visitor3).unwrap();
+        assert_eq!(visitor3.get_string_value(), Some(&"3.14".to_string()));
         
         unsafe {
             env::remove_var("TEST_number");
