@@ -1,9 +1,13 @@
 //! Builder for combining multiple configuration sources
 
-use crate::{Config, Error, Result, Source};
-use serde_json::Value;
+use crate::{Config, Result, Source};
+use crate::config::SourceVisitor;
 
 /// Builder that combines layers of sources to build configuration values
+/// 
+/// Sources are applied in order, with later sources overriding earlier ones.
+/// The builder uses a visitor pattern to efficiently query only the values
+/// needed by the target configuration type.
 pub struct Builder {
     sources: Vec<Box<dyn Source>>,
 }
@@ -17,45 +21,20 @@ impl Builder {
     }
     
     /// Add a source to the builder
-    /// Sources are applied in the order they are added
+    /// Sources are applied in the order they are added, with later sources
+    /// overriding values from earlier sources.
     pub fn add_source<S: Source + 'static>(mut self, source: S) -> Self {
         self.sources.push(Box::new(source));
         self
     }
     
-    /// Build a configuration value by applying all sources in order
-    /// All sources are merged into a single Value first, then converted to T
-    pub fn build<T: Config + Default>(&self) -> Result<T> {
-        if self.sources.is_empty() {
-            return Ok(T::default());
-        }
-        
-        // Merge all sources into a single value
-        let mut merged_value = Value::Object(serde_json::Map::new());
-        
-        for source in &self.sources {
-            let value = source.load()?;
-            merge_values(&mut merged_value, value)?;
-        }
-        
-        T::from_value(merged_value)
-    }
-    
-    /// Build a configuration value without requiring Default
-    /// All sources are merged into a single Value first, then converted to T
-    pub fn build_merged<T: Config>(&self) -> Result<T> {
-        if self.sources.is_empty() {
-            return Err(Error::Source("No sources provided".into()));
-        }
-        
-        let mut merged_value = Value::Object(serde_json::Map::new());
-        
-        for source in &self.sources {
-            let value = source.load()?;
-            merge_values(&mut merged_value, value)?;
-        }
-        
-        T::from_value(merged_value)
+    /// Build a configuration value by using the visitor pattern
+    /// 
+    /// The target configuration type specifies which values it needs,
+    /// and sources are queried only for those specific values.
+    pub fn build<T: Config>(&self) -> Result<T> {
+        let visitor = SourceVisitor::new(&self.sources);
+        T::configure_with_visitor(visitor)
     }
     
     /// Get the number of sources in the builder
@@ -75,31 +54,11 @@ impl Default for Builder {
     }
 }
 
-/// Helper function to merge JSON values
-fn merge_values(target: &mut Value, source: Value) -> Result<()> {
-    match (target, source) {
-        (Value::Object(target_map), Value::Object(source_map)) => {
-            for (key, value) in source_map {
-                if let Some(existing) = target_map.get_mut(&key) {
-                    merge_values(existing, value)?;
-                } else {
-                    target_map.insert(key, value);
-                }
-            }
-        }
-        (target, source) => {
-            *target = source;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::EnvSource;
+    use crate::source::{DeserializerSource, EnvSource};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
     use std::env;
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -117,18 +76,30 @@ mod tests {
 
     /// Mock source for testing
     struct MockSource {
-        data: Value,
+        data: std::collections::HashMap<String, String>,
     }
 
     impl MockSource {
-        fn new(data: Value) -> Self {
-            Self { data }
+        fn new() -> Self {
+            Self {
+                data: std::collections::HashMap::new(),
+            }
+        }
+        
+        fn with_value(mut self, key: &str, value: &str) -> Self {
+            self.data.insert(key.to_string(), value.to_string());
+            self
         }
     }
 
     impl Source for MockSource {
-        fn load(&self) -> Result<Value> {
-            Ok(self.data.clone())
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            Ok(self.data.get(key).cloned())
+        }
+        
+        fn keys(&self) -> Result<Box<dyn Iterator<Item = String>>> {
+            let keys: Vec<String> = self.data.keys().cloned().collect();
+            Ok(Box::new(keys.into_iter()))
         }
     }
 
@@ -141,14 +112,11 @@ mod tests {
 
     #[test]
     fn test_builder_single_source() {
-        let source = MockSource::new(serde_json::json!({
-            "name": "test",
-            "port": 8080,
-            "database": {
-                "host": "localhost",
-                "port": 5432
-            }
-        }));
+        let source = MockSource::new()
+            .with_value("name", "test")
+            .with_value("port", "8080")
+            .with_value("database.host", "localhost")
+            .with_value("database.port", "5432");
 
         let config: TestConfig = Builder::new()
             .add_source(source)
@@ -163,21 +131,15 @@ mod tests {
 
     #[test]
     fn test_builder_multiple_sources() {
-        let source1 = MockSource::new(serde_json::json!({
-            "name": "base",
-            "port": 3000,
-            "database": {
-                "host": "localhost",
-                "port": 5432
-            }
-        }));
+        let source1 = MockSource::new()
+            .with_value("name", "base")
+            .with_value("port", "3000")
+            .with_value("database.host", "localhost")
+            .with_value("database.port", "5432");
 
-        let source2 = MockSource::new(serde_json::json!({
-            "port": 8080,
-            "database": {
-                "host": "remote"
-            }
-        }));
+        let source2 = MockSource::new()
+            .with_value("port", "8080")
+            .with_value("database.host", "remote");
 
         let config: TestConfig = Builder::new()
             .add_source(source1)
@@ -192,28 +154,51 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_with_deserializer_source() {
+        let data = serde_json::json!({
+            "name": "from_json",
+            "port": 9000,
+            "database": {
+                "host": "json_host",
+                "port": 6000
+            }
+        });
+
+        let config: TestConfig = Builder::new()
+            .add_source(DeserializerSource::new(data))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.name, "from_json");
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.database.host, "json_host");
+        assert_eq!(config.database.port, 6000);
+    }
+
+    #[test]
     fn test_builder_with_env_source() {
         unsafe {
-            env::set_var("TEST_NAME", "env_test");
-            env::set_var("TEST_PORT", "9000");
-            env::set_var("TEST_DATABASE__HOST", "localhost");
-            env::set_var("TEST_DATABASE__PORT", "5432");
+            env::set_var("TEST_name", "env_test");
+            env::set_var("TEST_port", "9000");
+            env::set_var("TEST_database__host", "localhost");
+            env::set_var("TEST_database__port", "5432");
         }
 
-        let env_source = EnvSource::with_prefix("TEST");
-        
-        // Test that we can load the env source successfully
-        let env_data = env_source.load().unwrap();
-        assert_eq!(env_data["NAME"], Value::String("env_test".to_string()));
-        assert_eq!(env_data["PORT"], Value::String("9000".to_string()));
-        assert_eq!(env_data["DATABASE"]["HOST"], Value::String("localhost".to_string()));
-        assert_eq!(env_data["DATABASE"]["PORT"], Value::String("5432".to_string()));
+        let config: TestConfig = Builder::new()
+            .add_source(EnvSource::with_prefix("TEST"))
+            .build()
+            .unwrap();
+            
+        assert_eq!(config.name, "env_test");
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.database.host, "localhost");
+        assert_eq!(config.database.port, 5432);
 
         unsafe {
-            env::remove_var("TEST_NAME");
-            env::remove_var("TEST_PORT"); 
-            env::remove_var("TEST_DATABASE__HOST");
-            env::remove_var("TEST_DATABASE__PORT");
+            env::remove_var("TEST_name");
+            env::remove_var("TEST_port"); 
+            env::remove_var("TEST_database__host");
+            env::remove_var("TEST_database__port");
         }
     }
 }

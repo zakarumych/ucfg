@@ -5,11 +5,24 @@
 //!
 //! # Features
 //!
-//! - **Source trait**: Load configuration data from various sources
+//! - **Source trait**: Query configuration data from various sources efficiently
+//! - **Visitor pattern**: Load only required values, supporting arbitrarily large sources
 //! - **Environment variables**: Support for nested keys with prefix filtering
 //! - **Serde integration**: Works with any serde-compatible types
 //! - **Layered configuration**: Merge multiple sources with override support
 //! - **Builder pattern**: Flexible configuration building
+//!
+//! # Architecture
+//!
+//! The library uses a visitor pattern to efficiently handle large configuration sources.
+//! Instead of loading entire sources into memory, configuration types specify which
+//! values they need, and sources are queried only for those specific keys.
+//!
+//! This design allows the library to work with:
+//! - Large databases
+//! - Remote APIs
+//! - File systems
+//! - Any source that can provide key-value lookups
 //!
 //! # Quick Start
 //!
@@ -48,6 +61,12 @@
 //! - `APP_name` → `name`
 //! - `APP_database__host` → `database.host`
 //! - `APP_server__port` → `server.port`
+//!
+//! # Scalability
+//!
+//! The visitor pattern ensures that only required configuration values are loaded,
+//! making it efficient even for very large configuration sources. Sources can be
+//! arbitrarily large (databases, APIs, file systems) without memory concerns.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -57,7 +76,7 @@ pub mod config;
 pub mod builder;
 
 pub use source::{Source, DeserializerSource, EnvSource};
-pub use config::Config;
+pub use config::{Config, ConfigVisitor, SourceVisitor, FromStrConfig, value_from_str};
 pub use builder::Builder;
 
 /// Error type for configuration operations
@@ -122,7 +141,7 @@ mod integration_tests {
 
     #[test]
     fn test_full_configuration_example() {
-        // Setup environment variables - use lowercase to match JSON keys
+        // Setup environment variables
         unsafe {
             env::set_var("APP_name", "ProductionApp");
             env::set_var("APP_database__username", "produser");
@@ -152,7 +171,7 @@ mod integration_tests {
         });
 
         // Build configuration with multiple sources
-        let final_config: serde_json::Value = Builder::new()
+        let final_config: AppConfig = Builder::new()
             .add_source(DeserializerSource::new(base_config))
             .add_source(EnvSource::with_prefix("APP"))
             .add_source(DeserializerSource::new(override_config))
@@ -162,12 +181,12 @@ mod integration_tests {
         println!("Final config: {:#?}", final_config);
 
         // Verify the layered configuration
-        assert_eq!(final_config["name"], "ProductionApp");           // from env
-        assert_eq!(final_config["port"], 9000);                     // from override
-        assert_eq!(final_config["database"]["host"], "localhost");  // from base
-        assert_eq!(final_config["database"]["username"], "produser"); // from env
-        assert_eq!(final_config["features"]["logging"], false);     // from override
-        assert_eq!(final_config["features"]["metrics"], false);     // from base
+        assert_eq!(final_config.name, "ProductionApp");           // from env
+        assert_eq!(final_config.port, 9000);                     // from override
+        assert_eq!(final_config.database.host, "localhost");     // from base
+        assert_eq!(final_config.database.username, "produser");  // from env
+        assert_eq!(final_config.features.logging, false);        // from override
+        assert_eq!(final_config.features.metrics, false);        // from base
 
         // Cleanup
         unsafe {

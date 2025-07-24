@@ -1,25 +1,65 @@
 //! Source trait and implementations for loading configuration data
 
 use crate::{Error, Result};
-use serde_json::Value;
 use std::env;
 
-/// Trait for loading configuration data from various sources
+/// Trait for querying configuration data from various sources
+/// 
+/// Sources can be arbitrarily large (e.g., databases, file systems, remote APIs),
+/// so they support querying specific keys rather than loading all data at once.
 pub trait Source {
-    /// Load configuration data as a JSON Value
-    fn load(&self) -> Result<Value>;
+    /// Query a specific configuration value by key path
+    /// 
+    /// The key path uses dot notation for nested values (e.g., "database.host")
+    /// Returns None if the key is not found in this source
+    fn get(&self, key: &str) -> Result<Option<String>>;
+    
+    /// Check if this source contains a specific key
+    fn contains_key(&self, key: &str) -> Result<bool> {
+        self.get(key).map(|opt| opt.is_some())
+    }
+    
+    /// Get all available keys from this source
+    /// 
+    /// For large sources, this may be expensive or impossible.
+    /// Default implementation returns an empty iterator.
+    fn keys(&self) -> Result<Box<dyn Iterator<Item = String>>> {
+        Ok(Box::new(std::iter::empty()))
+    }
 }
 
-/// Source implementation for any serde Deserializer
-/// This works with data that can be deserialized into a Value
+/// Source implementation for any serde-serializable data
+/// 
+/// This converts the data to JSON internally and supports querying specific keys
 pub struct DeserializerSource<T> {
     data: T,
+    // Cache the JSON representation for efficient key lookups
+    json_cache: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 impl<T> DeserializerSource<T> {
     /// Create a new DeserializerSource
     pub fn new(data: T) -> Self {
-        Self { data }
+        Self { 
+            data,
+            json_cache: std::sync::Mutex::new(None),
+        }
+    }
+    
+    /// Get the JSON representation, caching it on first access
+    fn get_json(&self) -> Result<serde_json::Value>
+    where
+        T: serde::Serialize,
+    {
+        let mut cache = self.json_cache.lock().unwrap();
+        if let Some(ref cached) = *cache {
+            Ok(cached.clone())
+        } else {
+            let json = serde_json::to_value(&self.data)
+                .map_err(|e| Error::Source(Box::new(e)))?;
+            *cache = Some(json.clone());
+            Ok(json)
+        }
     }
 }
 
@@ -27,11 +67,74 @@ impl<T> Source for DeserializerSource<T>
 where
     T: serde::Serialize + Clone,
 {
-    fn load(&self) -> Result<Value> {
-        // Convert the data to a Value via serialization
-        serde_json::to_value(&self.data)
-            .map_err(|e| Error::Source(Box::new(e)))
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        let json = self.get_json()?;
+        
+        // Navigate the JSON using the dot notation key
+        let mut current = &json;
+        for part in key.split('.') {
+            match current {
+                serde_json::Value::Object(map) => {
+                    if let Some(value) = map.get(part) {
+                        current = value;
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        
+        // Convert the final value to a string
+        let result = match current {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => "null".to_string(),
+            // For objects and arrays, serialize them as JSON strings
+            other => serde_json::to_string(other)
+                .map_err(|e| Error::Source(Box::new(e)))?,
+        };
+        
+        Ok(Some(result))
     }
+    
+    fn keys(&self) -> Result<Box<dyn Iterator<Item = String>>> {
+        let json = self.get_json()?;
+        let keys = collect_json_keys(&json, "".to_string());
+        Ok(Box::new(keys.into_iter()))
+    }
+}
+
+/// Helper function to collect all keys from a JSON value using dot notation
+fn collect_json_keys(value: &serde_json::Value, prefix: String) -> Vec<String> {
+    let mut keys = Vec::new();
+    
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                let full_key = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                
+                // Add the key itself
+                keys.push(full_key.clone());
+                
+                // Recursively collect nested keys
+                keys.extend(collect_json_keys(val, full_key));
+            }
+        }
+        _ => {
+            // For non-object values, just add the prefix if it's not empty
+            if !prefix.is_empty() {
+                keys.push(prefix);
+            }
+        }
+    }
+    
+    keys
 }
 
 /// Source implementation for environment variables
@@ -63,37 +166,14 @@ impl EnvSource {
         self
     }
 
-    fn env_key_to_nested_key(&self, env_key: &str) -> String {
-        let key = if let Some(ref prefix) = self.prefix {
-            env_key.strip_prefix(&format!("{}_", prefix)).unwrap_or(env_key)
+    /// Convert a nested configuration key to an environment variable key
+    fn nested_key_to_env_key(&self, nested_key: &str) -> String {
+        let env_key = nested_key.replace('.', &self.separator);
+        if let Some(ref prefix) = self.prefix {
+            format!("{}_{}", prefix, env_key)
         } else {
             env_key
-        };
-        
-        key.replace(&self.separator, ".")
-    }
-
-    fn build_nested_value(&self, key: &str, value: String) -> Value {
-        let parts: Vec<&str> = key.split('.').collect();
-        
-        // Always build a nested structure, even for single keys
-        let mut result = serde_json::Map::new();
-        let mut current_map = &mut result;
-        
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                current_map.insert(part.to_string(), Value::String(value.clone()));
-            } else {
-                current_map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
-                // Get a mutable reference to the newly inserted map
-                match current_map.get_mut(*part).unwrap() {
-                    Value::Object(map) => current_map = map,
-                    _ => unreachable!(),
-                }
-            }
         }
-        
-        Value::Object(result)
     }
 }
 
@@ -104,50 +184,41 @@ impl Default for EnvSource {
 }
 
 impl Source for EnvSource {
-    fn load(&self) -> Result<Value> {
-        let mut result = serde_json::Map::new();
-        
-        for (key, value) in env::vars() {
-            let should_include = if let Some(ref prefix) = self.prefix {
-                key.starts_with(&format!("{}_", prefix))
-            } else {
-                true
-            };
-            
-            if should_include {
-                let nested_key = self.env_key_to_nested_key(&key);
-                let nested_value = self.build_nested_value(&nested_key, value);
-                
-                // Merge this value into the result
-                let mut result_value = Value::Object(result.clone());
-                merge_values(&mut result_value, nested_value)?;
-                if let Value::Object(map) = result_value {
-                    result = map;
-                }
-            }
-        }
-        
-        Ok(Value::Object(result))
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        let env_key = self.nested_key_to_env_key(key);
+        Ok(env::var(&env_key).ok())
     }
-}
-
-/// Helper function to merge JSON values
-fn merge_values(target: &mut Value, source: Value) -> Result<()> {
-    match (&mut *target, source) {
-        (Value::Object(target_map), Value::Object(source_map)) => {
-            for (key, value) in source_map {
-                if let Some(existing) = target_map.get_mut(&key) {
-                    merge_values(existing, value)?;
+    
+    fn keys(&self) -> Result<Box<dyn Iterator<Item = String>>> {
+        let prefix_filter = self.prefix.clone();
+        let separator = self.separator.clone();
+        
+        let keys: Vec<String> = env::vars()
+            .filter_map(move |(key, _)| {
+                let should_include = if let Some(ref prefix) = prefix_filter {
+                    key.starts_with(&format!("{}_", prefix))
                 } else {
-                    target_map.insert(key, value);
+                    true
+                };
+                
+                if should_include {
+                    // Convert env key to nested key using the instance method logic
+                    let nested_key = if let Some(ref prefix) = prefix_filter {
+                        key.strip_prefix(&format!("{}_", prefix)).unwrap_or(&key)
+                    } else {
+                        &key
+                    };
+                    
+                    let result = nested_key.replace(&separator, ".");
+                    Some(result)
+                } else {
+                    None
                 }
-            }
-        }
-        (target_ref, source) => {
-            *target_ref = source;
-        }
+            })
+            .collect();
+            
+        Ok(Box::new(keys.into_iter()))
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -163,18 +234,39 @@ mod tests {
         struct TestData {
             name: String,
             value: i32,
+            nested: NestedData,
+        }
+        
+        #[derive(Serialize, Deserialize, Clone)]
+        struct NestedData {
+            flag: bool,
         }
         
         let data = TestData {
             name: "test".to_string(),
             value: 42,
+            nested: NestedData { flag: true },
         };
         
         let source = DeserializerSource::new(data);
-        let result = source.load().unwrap();
         
-        assert_eq!(result["name"], Value::String("test".to_string()));
-        assert_eq!(result["value"], Value::Number(serde_json::Number::from(42)));
+        // Test simple key access
+        assert_eq!(source.get("name").unwrap(), Some("test".to_string()));
+        assert_eq!(source.get("value").unwrap(), Some("42".to_string()));
+        
+        // Test nested key access
+        assert_eq!(source.get("nested.flag").unwrap(), Some("true".to_string()));
+        
+        // Test non-existent key
+        assert_eq!(source.get("nonexistent").unwrap(), None);
+        assert_eq!(source.get("nested.nonexistent").unwrap(), None);
+        
+        // Test key listing
+        let keys: Vec<String> = source.keys().unwrap().collect();
+        assert!(keys.contains(&"name".to_string()));
+        assert!(keys.contains(&"value".to_string()));
+        assert!(keys.contains(&"nested".to_string()));
+        assert!(keys.contains(&"nested.flag".to_string()));
     }
 
     #[test]
@@ -184,9 +276,12 @@ mod tests {
         }
         
         let source = EnvSource::with_prefix("TEST");
-        let result = source.load().unwrap();
+        let result = source.get("KEY").unwrap();
         
-        assert_eq!(result["KEY"], Value::String("test_value".to_string()));
+        assert_eq!(result, Some("test_value".to_string()));
+        
+        // Test non-existent key
+        assert_eq!(source.get("NONEXISTENT").unwrap(), None);
         
         unsafe {
             env::remove_var("TEST_KEY");
@@ -201,14 +296,33 @@ mod tests {
         }
         
         let source = EnvSource::with_prefix("APP");
-        let result = source.load().unwrap();
         
-        assert_eq!(result["DB"]["HOST"], Value::String("localhost".to_string()));
-        assert_eq!(result["DB"]["PORT"], Value::String("5432".to_string()));
+        assert_eq!(source.get("DB.HOST").unwrap(), Some("localhost".to_string()));
+        assert_eq!(source.get("DB.PORT").unwrap(), Some("5432".to_string()));
+        
+        // Test key listing
+        let keys: Vec<String> = source.keys().unwrap().collect();
+        assert!(keys.contains(&"DB.HOST".to_string()));
+        assert!(keys.contains(&"DB.PORT".to_string()));
         
         unsafe {
             env::remove_var("APP_DB__HOST");
             env::remove_var("APP_DB__PORT");
+        }
+    }
+    
+    #[test]
+    fn test_env_source_no_prefix() {
+        unsafe {
+            env::set_var("SIMPLE_KEY", "simple_value");
+        }
+        
+        let source = EnvSource::new();
+        
+        assert_eq!(source.get("SIMPLE_KEY").unwrap(), Some("simple_value".to_string()));
+        
+        unsafe {
+            env::remove_var("SIMPLE_KEY");
         }
     }
 }
