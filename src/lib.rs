@@ -19,10 +19,28 @@
 //! values they need, and sources are queried only for those specific keys.
 //!
 //! This design allows the library to work with:
-//! - Large databases
-//! - Remote APIs
-//! - File systems
+//! - Large databases (implement `Source` with SQL queries)
+//! - Remote APIs (implement `Source` with HTTP requests)  
+//! - File systems (implement `Source` with file I/O)
+//! - In-memory data (use `DeserializerSource` for convenience)
 //! - Any source that can provide key-value lookups
+//!
+//! ## Source Implementations
+//!
+//! ### `DeserializerSource<T>`
+//! - Best for: Small to medium in-memory data structures
+//! - Limitation: Serializes data for each query (not suitable for very large data)
+//! - Use case: Configuration structs, JSON files loaded into memory
+//!
+//! ### Custom `Source` Implementations  
+//! - Best for: Large external sources (databases, APIs, file systems)
+//! - Advantage: True streaming and on-demand querying
+//! - Use case: Production applications with large configuration datasets
+//!
+//! ### `EnvSource`
+//! - Queries environment variables directly
+//! - Naturally scalable (no memory limitations)
+//! - Supports nested keys with configurable separators
 //!
 //! # Quick Start
 //!

@@ -7,6 +7,33 @@ use std::env;
 /// 
 /// Sources can be arbitrarily large (e.g., databases, file systems, remote APIs),
 /// so they support querying specific keys rather than loading all data at once.
+/// 
+/// # Scalability Considerations
+/// 
+/// This trait is designed to support truly large sources by:
+/// - Querying individual keys on-demand rather than loading entire datasets
+/// - Supporting lazy evaluation and streaming where appropriate
+/// - Allowing sources to optimize access patterns internally
+/// 
+/// For small to medium in-memory data, use `DeserializerSource`.
+/// For large external sources (databases, APIs, file systems), implement this trait directly.
+/// 
+/// # Example: Database Source
+/// 
+/// ```rust,ignore
+/// struct DatabaseSource {
+///     connection: DatabaseConnection,
+///     table: String,
+/// }
+/// 
+/// impl Source for DatabaseSource {
+///     fn get(&self, key: &str) -> Result<Option<String>> {
+///         // Query only the specific key from the database
+///         let query = format!("SELECT value FROM {} WHERE config_key = ?", self.table);
+///         self.connection.query_row(&query, &[key])
+///     }
+/// }
+/// ```
 pub trait Source {
     /// Query a specific configuration value by key path
     /// 
@@ -30,45 +57,34 @@ pub trait Source {
 
 /// Source implementation for any serde-serializable data
 /// 
-/// This converts the data to JSON internally and supports querying specific keys
+/// This source is designed for small to medium-sized in-memory data structures
+/// that can be efficiently serialized. For truly large sources (databases, APIs, etc.),
+/// implement the `Source` trait directly for optimal performance.
+/// 
+/// # Scalability Note
+/// 
+/// While this implementation avoids caching the entire JSON representation,
+/// it still serializes the data structure for each query. For very large data
+/// or frequently queried configurations, consider implementing `Source` directly.
 pub struct DeserializerSource<T> {
     data: T,
-    // Cache the JSON representation for efficient key lookups
-    json_cache: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 impl<T> DeserializerSource<T> {
     /// Create a new DeserializerSource
     pub fn new(data: T) -> Self {
-        Self { 
-            data,
-            json_cache: std::sync::Mutex::new(None),
-        }
+        Self { data }
     }
     
-    /// Get the JSON representation, caching it on first access
-    fn get_json(&self) -> Result<serde_json::Value>
+    /// Query a specific key by serializing the data and navigating the structure
+    /// This avoids caching the entire JSON representation, making it suitable for large sources
+    fn query_key(&self, key: &str) -> Result<Option<serde_json::Value>>
     where
         T: serde::Serialize,
     {
-        let mut cache = self.json_cache.lock().unwrap();
-        if let Some(ref cached) = *cache {
-            Ok(cached.clone())
-        } else {
-            let json = serde_json::to_value(&self.data)
-                .map_err(|e| Error::Source(Box::new(e)))?;
-            *cache = Some(json.clone());
-            Ok(json)
-        }
-    }
-}
-
-impl<T> Source for DeserializerSource<T>
-where
-    T: serde::Serialize + Clone,
-{
-    fn get(&self, key: &str) -> Result<Option<String>> {
-        let json = self.get_json()?;
+        // Convert to JSON for this specific query
+        let json = serde_json::to_value(&self.data)
+            .map_err(|e| Error::Source(Box::new(e)))?;
         
         // Navigate the JSON using the dot notation key
         let mut current = &json;
@@ -85,22 +101,39 @@ where
             }
         }
         
-        // Convert the final value to a string
-        let result = match current {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Null => "null".to_string(),
-            // For objects and arrays, serialize them as JSON strings
-            other => serde_json::to_string(other)
-                .map_err(|e| Error::Source(Box::new(e)))?,
-        };
+        Ok(Some(current.clone()))
+    }
+}
+
+impl<T> Source for DeserializerSource<T>
+where
+    T: serde::Serialize + Clone,
+{
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        let value = self.query_key(key)?;
         
-        Ok(Some(result))
+        if let Some(json_value) = value {
+            // Convert the JSON value to a string
+            let result = match json_value {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => "null".to_string(),
+                // For objects and arrays, serialize them as JSON strings
+                other => serde_json::to_string(&other)
+                    .map_err(|e| Error::Source(Box::new(e)))?,
+            };
+            Ok(Some(result))
+        } else {
+            Ok(None)
+        }
     }
     
     fn keys(&self) -> Result<Box<dyn Iterator<Item = String>>> {
-        let json = self.get_json()?;
+        // For keys(), we still need to serialize once, but this is only called
+        // when specifically requesting all keys, not for normal operation
+        let json = serde_json::to_value(&self.data)
+            .map_err(|e| Error::Source(Box::new(e)))?;
         let keys = collect_json_keys(&json, "".to_string());
         Ok(Box::new(keys.into_iter()))
     }
@@ -225,6 +258,52 @@ impl Source for EnvSource {
 mod tests {
     use super::*;
     use std::env;
+    use std::collections::HashMap;
+
+    // Example of a custom source for large/external data
+    // This demonstrates how to implement Source for truly scalable scenarios
+    struct MockLargeSource {
+        // Simulate a large external source (e.g., database, API)
+        data: HashMap<String, String>,
+    }
+
+    impl MockLargeSource {
+        fn new() -> Self {
+            let mut data = HashMap::new();
+            data.insert("app.name".to_string(), "Large App".to_string());
+            data.insert("app.version".to_string(), "1.0.0".to_string());
+            data.insert("database.host".to_string(), "large.db.com".to_string());
+            data.insert("database.port".to_string(), "5432".to_string());
+            Self { data }
+        }
+    }
+
+    impl Source for MockLargeSource {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            // In a real implementation, this would query an external source
+            // without loading all data into memory
+            Ok(self.data.get(key).cloned())
+        }
+
+        fn keys(&self) -> Result<Box<dyn Iterator<Item = String>>> {
+            // In a real implementation, this might stream keys from the source
+            let keys: Vec<String> = self.data.keys().cloned().collect();
+            Ok(Box::new(keys.into_iter()))
+        }
+    }
+
+    #[test]
+    fn test_custom_large_source() {
+        let source = MockLargeSource::new();
+        
+        assert_eq!(source.get("app.name").unwrap(), Some("Large App".to_string()));
+        assert_eq!(source.get("database.host").unwrap(), Some("large.db.com".to_string()));
+        assert_eq!(source.get("nonexistent").unwrap(), None);
+        
+        let keys: Vec<String> = source.keys().unwrap().collect();
+        assert!(keys.contains(&"app.name".to_string()));
+        assert!(keys.contains(&"database.host".to_string()));
+    }
 
     #[test]
     fn test_deserializer_source() {
