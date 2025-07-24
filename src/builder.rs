@@ -4,9 +4,9 @@ use crate::{Config, Result, Source};
 
 /// Builder that combines layers of sources to build configuration values
 /// 
-/// Sources are applied in order, with later sources overriding earlier ones.
-/// The builder passes all sources to the Config implementation which visits
-/// them to gather the values it needs.
+/// The builder coordinates between Config implementations and Sources,
+/// allowing Config to visit sources in the order they were added.
+/// Later sources override earlier ones when they provide values for the same fields.
 pub struct Builder {
     sources: Vec<Box<dyn Source>>,
 }
@@ -27,12 +27,13 @@ impl Builder {
         self
     }
     
-    /// Build a configuration value by having the Config visit all sources
+    /// Build a configuration value by coordinating Config and Sources
     /// 
-    /// The target configuration type specifies which values it needs,
-    /// and visits sources to gather those specific values.
+    /// The builder creates a combined source that checks sources in reverse order
+    /// (latest first) so that later sources override earlier ones.
     pub fn build<T: Config>(&self) -> Result<T> {
-        T::configure_from_sources(&self.sources)
+        let combined_source = CombinedSource::new(&self.sources);
+        T::configure_from_source(&combined_source)
     }
     
     /// Get the number of sources in the builder
@@ -52,39 +53,87 @@ impl Default for Builder {
     }
 }
 
+/// Internal combined source that checks sources in override order
+struct CombinedSource<'a> {
+    sources: &'a [Box<dyn Source>],
+}
+
+impl<'a> CombinedSource<'a> {
+    fn new(sources: &'a [Box<dyn Source>]) -> Self {
+        Self { sources }
+    }
+}
+
+impl<'a> Source for CombinedSource<'a> {
+    fn get_field(&self, field: &str) -> Result<Option<String>> {
+        // Check sources in reverse order so later sources override earlier ones
+        for source in self.sources.iter().rev() {
+            if let Some(value) = source.get_field(field)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source::EnvSource;
-    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use std::env;
 
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, PartialEq)]
     struct TestConfig {
         name: String,
         port: u16,
     }
 
+    impl Default for TestConfig {
+        fn default() -> Self {
+            Self {
+                name: "default".to_string(),
+                port: 3000,
+            }
+        }
+    }
+
+    impl Config for TestConfig {
+        fn configure_from_source(source: &dyn Source) -> Result<Self> {
+            let mut config = Self::default();
+            
+            if let Some(name) = source.get_field("name")? {
+                config.name = name;
+            }
+            
+            if let Some(port_str) = source.get_field("port")? {
+                config.port = crate::config::parse_field_value(&port_str)?;
+            }
+            
+            Ok(config)
+        }
+    }
+
     /// Mock source for testing
     struct MockSource {
-        data: std::collections::HashMap<String, serde_json::Value>,
+        data: HashMap<String, String>,
     }
 
     impl MockSource {
         fn new() -> Self {
             Self {
-                data: std::collections::HashMap::new(),
+                data: HashMap::new(),
             }
         }
         
-        fn with_field(mut self, field: &str, value: serde_json::Value) -> Self {
-            self.data.insert(field.to_string(), value);
+        fn with_field(mut self, field: &str, value: &str) -> Self {
+            self.data.insert(field.to_string(), value.to_string());
             self
         }
     }
 
     impl Source for MockSource {
-        fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>> {
+        fn get_field(&self, field: &str) -> Result<Option<String>> {
             Ok(self.data.get(field).cloned())
         }
     }
@@ -99,8 +148,8 @@ mod tests {
     #[test]
     fn test_builder_single_source() {
         let source = MockSource::new()
-            .with_field("name", serde_json::Value::String("test".to_string()))
-            .with_field("port", serde_json::Value::Number(serde_json::Number::from(8080)));
+            .with_field("name", "test")
+            .with_field("port", "8080");
 
         let config: TestConfig = Builder::new()
             .add_source(source)
@@ -114,11 +163,11 @@ mod tests {
     #[test]
     fn test_builder_multiple_sources() {
         let source1 = MockSource::new()
-            .with_field("name", serde_json::Value::String("base".to_string()))
-            .with_field("port", serde_json::Value::Number(serde_json::Number::from(3000)));
+            .with_field("name", "base")
+            .with_field("port", "3000");
 
         let source2 = MockSource::new()
-            .with_field("port", serde_json::Value::Number(serde_json::Number::from(8080)));
+            .with_field("port", "8080");
 
         let config: TestConfig = Builder::new()
             .add_source(source1)

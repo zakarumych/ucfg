@@ -7,12 +7,15 @@ use std::env;
 /// 
 /// Sources should be efficient and handle arbitrarily large datasets by providing
 /// values only for requested fields rather than loading entire datasets.
+/// 
+/// Sources can return string values or provide deserializer implementations
+/// depending on the nature of the data source.
 pub trait Source {
-    /// Get a value for a specific field
+    /// Get a string value for a specific field
     /// 
     /// Returns None if the field is not available in this source.
     /// The field name should be a simple identifier without complex paths.
-    fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>>;
+    fn get_field(&self, field: &str) -> Result<Option<String>>;
 }
 
 /// Source implementation for environment variables
@@ -50,26 +53,9 @@ impl Default for EnvSource {
 }
 
 impl Source for EnvSource {
-    fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>> {
+    fn get_field(&self, field: &str) -> Result<Option<String>> {
         let env_key = self.field_to_env_key(field);
-        if let Ok(value) = env::var(&env_key) {
-            // Try to parse as different types for better type compatibility
-            if let Ok(bool_val) = value.parse::<bool>() {
-                Ok(Some(serde_json::Value::Bool(bool_val)))
-            } else if let Ok(int_val) = value.parse::<i64>() {
-                Ok(Some(serde_json::Value::Number(serde_json::Number::from(int_val))))
-            } else if let Ok(float_val) = value.parse::<f64>() {
-                if let Some(num) = serde_json::Number::from_f64(float_val) {
-                    Ok(Some(serde_json::Value::Number(num)))
-                } else {
-                    Ok(Some(serde_json::Value::String(value)))
-                }
-            } else {
-                Ok(Some(serde_json::Value::String(value)))
-            }
-        } else {
-            Ok(None)
-        }
+        Ok(env::var(&env_key).ok())
     }
 }
 
@@ -87,7 +73,7 @@ mod tests {
         let source = EnvSource::with_prefix("TEST");
         let result = source.get_field("KEY").unwrap();
         
-        assert_eq!(result, Some(serde_json::Value::String("test_value".to_string())));
+        assert_eq!(result, Some("test_value".to_string()));
         
         // Test non-existent field
         assert_eq!(source.get_field("NONEXISTENT").unwrap(), None);
@@ -105,7 +91,7 @@ mod tests {
         
         let source = EnvSource::new();
         
-        assert_eq!(source.get_field("SIMPLE_KEY").unwrap(), Some(serde_json::Value::String("simple_value".to_string())));
+        assert_eq!(source.get_field("SIMPLE_KEY").unwrap(), Some("simple_value".to_string()));
         
         unsafe {
             env::remove_var("SIMPLE_KEY");
@@ -113,7 +99,7 @@ mod tests {
     }
     
     #[test]
-    fn test_env_source_type_conversion() {
+    fn test_env_source_returns_strings() {
         unsafe {
             env::set_var("TEST_number", "42");
             env::set_var("TEST_flag", "true");
@@ -122,20 +108,10 @@ mod tests {
         
         let source = EnvSource::with_prefix("TEST");
         
-        // Test number conversion
-        assert_eq!(source.get_field("number").unwrap(), 
-                   Some(serde_json::Value::Number(serde_json::Number::from(42))));
-        
-        // Test boolean conversion
-        assert_eq!(source.get_field("flag").unwrap(), 
-                   Some(serde_json::Value::Bool(true)));
-        
-        // Test float conversion
-        if let Some(serde_json::Value::Number(n)) = source.get_field("float").unwrap() {
-            assert!((n.as_f64().unwrap() - 3.14).abs() < f64::EPSILON);
-        } else {
-            panic!("Expected a number");
-        }
+        // Environment source returns raw strings - parsing is done by Config
+        assert_eq!(source.get_field("number").unwrap(), Some("42".to_string()));
+        assert_eq!(source.get_field("flag").unwrap(), Some("true".to_string()));
+        assert_eq!(source.get_field("float").unwrap(), Some("3.14".to_string()));
         
         unsafe {
             env::remove_var("TEST_number");

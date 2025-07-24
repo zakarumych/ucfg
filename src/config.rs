@@ -1,146 +1,107 @@
 //! Config trait for types that can be configured from sources
 
-use crate::{Error, Result, Source};
-use serde::de::DeserializeOwned;
+use crate::{Result, Source};
 use std::str::FromStr;
 
 /// Trait for types that can be configured by visiting sources
 /// 
-/// The Config implementation visits sources to gather the values it needs
-/// and assembles them into the final configuration.
+/// Implementations should define how to extract and parse the specific
+/// fields they need from the provided source.
 pub trait Config: Sized {
-    /// Configure this type by visiting the provided sources
+    /// Configure this type by visiting a single source
     /// 
-    /// Sources are checked in order, with later sources overriding earlier ones.
-    /// The implementation should query only the fields it needs.
-    fn configure_from_sources(sources: &[Box<dyn Source>]) -> Result<Self>;
+    /// The implementation should query the source for the fields it needs
+    /// and parse them appropriately (typically using FromStr for environment
+    /// variables or serde for structured data).
+    fn configure_from_source(source: &dyn Source) -> Result<Self>;
 }
 
-/// Blanket implementation for types that implement serde::Deserialize and Default
-impl<T> Config for T
-where
-    T: DeserializeOwned + serde::Serialize + Default,
-{
-    fn configure_from_sources(sources: &[Box<dyn Source>]) -> Result<Self> {
-        // Start with the default instance to discover the structure
-        let default_instance = T::default();
-        let default_json = serde_json::to_value(&default_instance)
-            .map_err(|e| Error::Deserialize(e.to_string()))?;
-            
-        // Visit sources to build the final configuration
-        let configured_json = visit_sources_for_json(sources, &default_json)?;
-        
-        // Deserialize the final JSON
-        serde_json::from_value(configured_json)
-            .map_err(|e| Error::Deserialize(e.to_string()))
-    }
-}
-
-/// Helper function to visit sources and build JSON configuration
-fn visit_sources_for_json(
-    sources: &[Box<dyn Source>],
-    default_json: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    match default_json {
-        serde_json::Value::Object(map) => {
-            let mut result = serde_json::Map::new();
-            
-            for (field, default_value) in map {
-                // Visit sources in reverse order so later sources override earlier ones
-                let mut final_value = default_value.clone();
-                
-                for source in sources.iter().rev() {
-                    if let Some(source_value) = source.get_field(field)? {
-                        final_value = source_value;
-                        break; // Use the first source that has this field
-                    }
-                }
-                
-                result.insert(field.clone(), final_value);
-            }
-            
-            Ok(serde_json::Value::Object(result))
-        }
-        _ => {
-            // For non-object values, just return the default
-            Ok(default_json.clone())
-        }
-    }
-}
-
-/// Helper trait for types that can be configured from strings
-pub trait FromStrConfig: Sized {
-    type Err;
-    fn from_str_config(s: &str) -> std::result::Result<Self, Self::Err>;
-}
-
-/// Blanket implementation for types that implement FromStr
-impl<T> FromStrConfig for T
+/// Helper function for parsing field values using FromStr
+pub fn parse_field_value<T>(value: &str) -> Result<T>
 where
     T: FromStr,
+    T::Err: std::fmt::Display,
 {
-    type Err = T::Err;
-    
-    fn from_str_config(s: &str) -> std::result::Result<Self, Self::Err> {
-        T::from_str(s)
-    }
-}
-
-/// Convert a source value to a type that implements FromStr
-pub fn value_from_str<T>(value: &str) -> Result<T>
-where
-    T: FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-{
-    T::from_str(value).map_err(|e| Error::Source(Box::new(e)))
+    T::from_str(value).map_err(|e| crate::Error::Parse(format!("Failed to parse '{}': {}", value, e)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-    struct TestConfig {
+    /// Simple test struct for manual Config implementation
+    #[derive(Debug, Clone, PartialEq)]
+    struct SimpleConfig {
         name: String,
         port: u16,
         enabled: bool,
     }
 
+    impl Default for SimpleConfig {
+        fn default() -> Self {
+            Self {
+                name: "default".to_string(),
+                port: 3000,
+                enabled: false,
+            }
+        }
+    }
+
+    impl Config for SimpleConfig {
+        fn configure_from_source(source: &dyn Source) -> Result<Self> {
+            let mut config = Self::default();
+            
+            // Try to get name field
+            if let Some(name_str) = source.get_field("name")? {
+                config.name = name_str;
+            }
+            
+            // Try to get port field and parse it
+            if let Some(port_str) = source.get_field("port")? {
+                config.port = parse_field_value(&port_str)?;
+            }
+            
+            // Try to get enabled field and parse it
+            if let Some(enabled_str) = source.get_field("enabled")? {
+                config.enabled = parse_field_value(&enabled_str)?;
+            }
+            
+            Ok(config)
+        }
+    }
+
     struct MockSource {
-        data: std::collections::HashMap<String, serde_json::Value>,
+        data: HashMap<String, String>,
     }
 
     impl MockSource {
         fn new() -> Self {
             Self {
-                data: std::collections::HashMap::new(),
+                data: HashMap::new(),
             }
         }
         
-        fn with_field(mut self, field: &str, value: serde_json::Value) -> Self {
-            self.data.insert(field.to_string(), value);
+        fn with_field(mut self, field: &str, value: &str) -> Self {
+            self.data.insert(field.to_string(), value.to_string());
             self
         }
     }
 
     impl Source for MockSource {
-        fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>> {
+        fn get_field(&self, field: &str) -> Result<Option<String>> {
             Ok(self.data.get(field).cloned())
         }
     }
 
     #[test]
-    fn test_config_from_sources() {
-        let source1 = MockSource::new()
-            .with_field("name", serde_json::Value::String("test".to_string()))
-            .with_field("port", serde_json::Value::Number(serde_json::Number::from(8080)));
+    fn test_config_from_source() {
+        let source = MockSource::new()
+            .with_field("name", "test")
+            .with_field("port", "8080")
+            .with_field("enabled", "true");
         
-        let source2 = MockSource::new()
-            .with_field("enabled", serde_json::Value::Bool(true));
-        
-        let sources: Vec<Box<dyn Source>> = vec![Box::new(source1), Box::new(source2)];
-        let config = TestConfig::configure_from_sources(&sources).unwrap();
+        let config = SimpleConfig::configure_from_source(&source).unwrap();
         
         assert_eq!(config.name, "test");
         assert_eq!(config.port, 8080);
@@ -148,28 +109,27 @@ mod tests {
     }
 
     #[test]
-    fn test_config_with_overrides() {
-        let source1 = MockSource::new()
-            .with_field("name", serde_json::Value::String("base".to_string()))
-            .with_field("port", serde_json::Value::Number(serde_json::Number::from(3000)));
+    fn test_config_partial_override() {
+        let source = MockSource::new()
+            .with_field("port", "9000");
         
-        let source2 = MockSource::new()
-            .with_field("port", serde_json::Value::Number(serde_json::Number::from(8080)));
+        let config = SimpleConfig::configure_from_source(&source).unwrap();
         
-        let sources: Vec<Box<dyn Source>> = vec![Box::new(source1), Box::new(source2)];
-        let config = TestConfig::configure_from_sources(&sources).unwrap();
-        
-        assert_eq!(config.name, "base");     // from source1
-        assert_eq!(config.port, 8080);      // overridden by source2
-        assert_eq!(config.enabled, false);  // default value
+        assert_eq!(config.name, "default");  // default value
+        assert_eq!(config.port, 9000);       // from source
+        assert_eq!(config.enabled, false);   // default value
     }
 
     #[test]
-    fn test_value_from_str() {
-        let result: i32 = value_from_str("42").unwrap();
+    fn test_parse_field_value() {
+        let result: i32 = parse_field_value("42").unwrap();
         assert_eq!(result, 42);
         
-        let result: bool = value_from_str("true").unwrap();
+        let result: bool = parse_field_value("true").unwrap();
         assert_eq!(result, true);
+        
+        // Test error case
+        let result: std::result::Result<i32, _> = parse_field_value("not_a_number");
+        assert!(result.is_err());
     }
 }

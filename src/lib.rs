@@ -1,22 +1,23 @@
 //! Ultimate Configuration Library
 //!
 //! This library provides a comprehensive solution for configuring applications from various sources,
-//! layering configurations, supporting overloads, extensions, and more.
+//! with a focus on efficiency and scalability.
 //!
-//! # Features
+//! # Key Principles
 //!
-//! - **Source trait**: Provide configuration values efficiently from various sources
-//! - **Direct source visiting**: Config types visit sources directly for needed values
-//! - **Environment variables**: Support for simple field-based environment variable mapping
-//! - **Serde integration**: Works with any serde-compatible types
-//! - **Layered configuration**: Merge multiple sources with override support
-//! - **Builder pattern**: Flexible configuration building
+//! - **No JSON bias**: Sources return strings, Config implementations choose parsing strategy
+//! - **FromStr first**: Environment variables use FromStr parsing by default for better type safety
+//! - **Individual source visiting**: Config visits one source at a time, Builder coordinates
+//! - **Manual implementations**: No blanket Config implementations - explicit control over parsing
+//! - **Scalable sources**: Sources can be arbitrarily large (databases, APIs) without memory concerns
 //!
 //! # Architecture
 //!
-//! The library uses a direct visiting pattern where Config implementations visit sources
-//! to gather the values they need. Sources provide values for specific fields rather than
-//! complex key paths, keeping the architecture simple and efficient.
+//! The library uses a coordinated approach where:
+//! 1. `Builder` coordinates multiple sources with override semantics  
+//! 2. `Config` implementations define how to extract and parse specific fields
+//! 3. `Source` implementations provide string values for requested fields
+//! 4. Field parsing uses `FromStr` for environment variables, custom logic for other sources
 //!
 //! This design allows the library to work with:
 //! - Large databases (implement `Source` with SQL queries for specific fields)
@@ -25,33 +26,52 @@
 //! - Environment variables (use `EnvSource` for field-based env var mapping)
 //! - Any source that can provide field-value lookups
 //!
-//! ## Source Implementations
-//!
-//! ### Custom `Source` Implementations  
-//! - Best for: Large external sources (databases, APIs, file systems)
-//! - Advantage: True streaming and on-demand querying
-//! - Use case: Production applications with large configuration datasets
-//!
-//! ### `EnvSource`
-//! - Queries environment variables directly using simple field names
-//! - Naturally scalable (no memory limitations)
-//! - Maps field names to environment variables with optional prefixes
-//!
 //! # Quick Start
 //!
 //! ```rust
-//! use ucfg::{Builder, EnvSource};
-//! use serde::{Deserialize, Serialize};
+//! use ucfg::{Builder, EnvSource, Config, parse_field_value};
+//! use std::str::FromStr;
 //!
-//! #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-//! struct Config {
+//! #[derive(Debug, Clone, PartialEq)]
+//! struct AppConfig {
 //!     name: String,
 //!     port: u16,
+//!     enabled: bool,
+//! }
+//!
+//! impl Default for AppConfig {
+//!     fn default() -> Self {
+//!         Self {
+//!             name: "MyApp".to_string(),
+//!             port: 3000,
+//!             enabled: false,
+//!         }
+//!     }
+//! }
+//!
+//! impl Config for AppConfig {
+//!     fn configure_from_source(source: &dyn ucfg::Source) -> ucfg::Result<Self> {
+//!         let mut config = Self::default();
+//!         
+//!         if let Some(name) = source.get_field("name")? {
+//!             config.name = name;
+//!         }
+//!         
+//!         if let Some(port_str) = source.get_field("port")? {
+//!             config.port = parse_field_value(&port_str)?;
+//!         }
+//!         
+//!         if let Some(enabled_str) = source.get_field("enabled")? {
+//!             config.enabled = parse_field_value(&enabled_str)?;
+//!         }
+//!         
+//!         Ok(config)
+//!     }
 //! }
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Build configuration from environment variables
-//! let config: Config = Builder::new()
+//! let config: AppConfig = Builder::new()
 //!     .add_source(EnvSource::with_prefix("APP"))
 //!     .build()?;
 //!
@@ -64,13 +84,13 @@
 //!
 //! Environment variables are mapped to configuration fields using simple names:
 //!
-//! - `APP_name` → `name` field
-//! - `APP_port` → `port` field
-//! - `APP_enabled` → `enabled` field
+//! - `APP_name` → `name` field (used as string)
+//! - `APP_port` → `port` field (parsed using `FromStr`)
+//! - `APP_enabled` → `enabled` field (parsed using `FromStr`)
 //!
 //! # Scalability
 //!
-//! The direct visiting pattern ensures that only required configuration values are loaded,
+//! The field-based visiting pattern ensures that only required configuration values are loaded,
 //! making it efficient even for very large configuration sources. Sources can be
 //! arbitrarily large (databases, APIs, file systems) without memory concerns.
 
@@ -82,7 +102,7 @@ pub mod config;
 pub mod builder;
 
 pub use source::{Source, EnvSource};
-pub use config::{Config, FromStrConfig, value_from_str};
+pub use config::{Config, parse_field_value};
 pub use builder::Builder;
 
 /// Error type for configuration operations
@@ -90,6 +110,8 @@ pub use builder::Builder;
 pub enum Error {
     /// Error from a source
     Source(Box<dyn StdError + Send + Sync>),
+    /// Error during parsing field values
+    Parse(String),
     /// Error during deserialization
     Deserialize(String),
     /// Error during merging
@@ -100,6 +122,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Source(e) => write!(f, "Source error: {}", e),
+            Error::Parse(msg) => write!(f, "Parse error: {}", msg),
             Error::Deserialize(msg) => write!(f, "Deserialization error: {}", msg),
             Error::Merge(msg) => write!(f, "Merge error: {}", msg),
         }
@@ -121,14 +144,43 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
     use std::env;
 
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, PartialEq)]
     struct AppConfig {
         name: String,
         port: u16,
         enabled: bool,
+    }
+
+    impl Default for AppConfig {
+        fn default() -> Self {
+            Self {
+                name: "DefaultApp".to_string(),
+                port: 3000,
+                enabled: false,
+            }
+        }
+    }
+
+    impl Config for AppConfig {
+        fn configure_from_source(source: &dyn Source) -> Result<Self> {
+            let mut config = Self::default();
+            
+            if let Some(name) = source.get_field("name")? {
+                config.name = name;
+            }
+            
+            if let Some(port_str) = source.get_field("port")? {
+                config.port = config::parse_field_value(&port_str)?;
+            }
+            
+            if let Some(enabled_str) = source.get_field("enabled")? {
+                config.enabled = config::parse_field_value(&enabled_str)?;
+            }
+            
+            Ok(config)
+        }
     }
 
     #[test]

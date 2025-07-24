@@ -3,8 +3,7 @@
 //! This demonstrates how to create truly scalable sources that can handle
 //! arbitrarily large datasets without loading everything into memory.
 
-use ucfg::{Source, Result, Builder};
-use serde::{Serialize, Deserialize};
+use ucfg::{Source, Result, Builder, Config, parse_field_value};
 use std::collections::HashMap;
 
 /// Example database source that queries configuration from a simulated database
@@ -33,7 +32,7 @@ impl DatabaseSource {
 }
 
 impl Source for DatabaseSource {
-    fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>> {
+    fn get_field(&self, field: &str) -> Result<Option<String>> {
         // In a real implementation, this would execute:
         // SELECT value FROM {table_name} WHERE field_name = ?
         
@@ -42,18 +41,7 @@ impl Source for DatabaseSource {
         // Simulate database query latency
         std::thread::sleep(std::time::Duration::from_millis(1));
         
-        if let Some(value) = self.simulated_db.get(field) {
-            // Parse the value appropriately
-            if let Ok(bool_val) = value.parse::<bool>() {
-                Ok(Some(serde_json::Value::Bool(bool_val)))
-            } else if let Ok(int_val) = value.parse::<i64>() {
-                Ok(Some(serde_json::Value::Number(serde_json::Number::from(int_val))))
-            } else {
-                Ok(Some(serde_json::Value::String(value.clone())))
-            }
-        } else {
-            Ok(None)
-        }
+        Ok(self.simulated_db.get(field).cloned())
     }
 }
 
@@ -71,7 +59,7 @@ impl ApiSource {
 }
 
 impl Source for ApiSource {
-    fn get_field(&self, field: &str) -> Result<Option<serde_json::Value>> {
+    fn get_field(&self, field: &str) -> Result<Option<String>> {
         // In a real implementation, this would make an HTTP request:
         // GET {base_url}/config/{field}
         
@@ -79,20 +67,60 @@ impl Source for ApiSource {
         
         // Simulate some API responses
         match field {
-            "logging" => Ok(Some(serde_json::Value::Bool(true))),
-            "timeout" => Ok(Some(serde_json::Value::Number(serde_json::Number::from(30)))),
+            "logging" => Ok(Some("true".to_string())),
+            "timeout" => Ok(Some("30".to_string())),
             _ => Ok(None),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug)]
 struct AppConfig {
     name: String,
     port: u16,
     enabled: bool,
     logging: bool,
     timeout: u32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            name: "DefaultApp".to_string(),
+            port: 3000,
+            enabled: false,
+            logging: false,
+            timeout: 10,
+        }
+    }
+}
+
+impl Config for AppConfig {
+    fn configure_from_source(source: &dyn Source) -> Result<Self> {
+        let mut config = Self::default();
+        
+        if let Some(name) = source.get_field("name")? {
+            config.name = name;
+        }
+        
+        if let Some(port_str) = source.get_field("port")? {
+            config.port = parse_field_value(&port_str)?;
+        }
+        
+        if let Some(enabled_str) = source.get_field("enabled")? {
+            config.enabled = parse_field_value(&enabled_str)?;
+        }
+        
+        if let Some(logging_str) = source.get_field("logging")? {
+            config.logging = parse_field_value(&logging_str)?;
+        }
+        
+        if let Some(timeout_str) = source.get_field("timeout")? {
+            config.timeout = parse_field_value(&timeout_str)?;
+        }
+        
+        Ok(config)
+    }
 }
 
 fn main() -> Result<()> {
